@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+# dimension is single thread reduced d, default 15
+import numpy as np
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+from sklearn.cluster import MiniBatchKMeans
+from scipy.sparse import csr_matrix, vstack
+from joblib import Parallel, delayed
+from sklearn.decomposition import TruncatedSVD
+from kneed import KneeLocator
+import sys
+import gzip
+
+class Dataset1:
+    def __init__(self, rows, cols):
+        self.data = np.zeros((rows, cols), dtype=np.float32)
+
+    def fill(self, value):
+        self.data.fill(value)
+
+    def num_rows(self):
+        return self.data.shape[0]
+
+    def num_cols(self):
+        return self.data.shape[1]
+
+    def __getitem__(self, index):
+        return self.data[index]
+
+    def __setitem__(self, index, value):
+        self.data[index] = value
+
+class FVParserToken:
+    def __init__(self, dimension, value):
+        self.dimension = dimension
+        self.value = value
+
+class FVParser:
+    def __init__(self, input_str):
+        self.original_input = input_str
+        self.reset()
+
+    def reset(self):
+        self.input_stream = self.original_input.splitlines()
+        self.line_number = 0
+
+    def next_line(self):
+        while self.input_stream:
+            buffer = self.input_stream.pop(0).strip()
+
+            if not buffer:
+                continue
+
+            if not buffer.startswith('T'):
+                continue
+            sample = []
+            for part in buffer.split():
+
+                try:
+                    dimension, value = map(int, part.lstrip(':').split(':'))
+                    sample.append(FVParserToken(dimension, float(value)))
+                except ValueError:
+                    continue
+
+            if sample:
+                self.line_number += 1
+                return sample
+
+
+        return None
+
+    def current_line_number(self):
+        return self.line_number
+
+
+def size_of_fv_file(parser):
+    num_points = 0
+    num_dims = 0
+
+    while True:
+        tokens = parser.next_line()
+        if tokens is None:
+            break
+        num_points += 1
+        for token in tokens:
+            num_dims = max(num_dims, token.dimension)
+    return num_points, num_dims
+
+def load_fv_file(parser, result):
+    result.fill(0.0)
+
+    row_weights = np.zeros(result.num_rows())
+
+
+    point = 0
+    while True:
+        current_vector = parser.next_line()
+        if current_vector is None:
+            break
+
+        sum_vector = sum(token.value for token in current_vector)
+
+        row_weights[point] = sum_vector
+
+        for i,token in enumerate(current_vector):
+            dim = token.dimension
+            val = token.value / sum_vector
+            result[point][dim-1] = val
+
+        point += 1
+
+def process_thread(thread_data,dimension):
+    svd = TruncatedSVD(n_components=dimension)  # Adjust the number of components as needed
+    reduced_data = svd.fit_transform(thread_data)
+    return reduced_data
+
+def compute_wcss(data, max_k,n_init,random_state):
+    wcss = []
+    for k in range(1, max_k+1):
+        kmeans = MiniBatchKMeans(n_clusters=k, batch_size=1000,n_init=n_init, random_state=random_state)
+        kmeans.fit(data)
+        wcss.append(kmeans.inertia_)
+    return wcss
+
+def find_best_k(data, max_k, n_init,random_state):
+    wcss = compute_wcss(data, max_k,n_init,random_state)
+    k_values = range(1, max_k+1)
+    kneedle = KneeLocator(k_values, wcss, curve='convex', direction='decreasing')
+    optimal_k = kneedle.elbow
+    print("optimal_k kneedle:",optimal_k)
+    # Define a narrower range around the elbow point
+    narrow_k_range = range(max(2, optimal_k - 5), min(optimal_k + 5, 21))
+
+    # Compute silhouette scores for the narrowed ranger
+    silhouette_scores = []
+    for k in narrow_k_range:
+        kmeans = MiniBatchKMeans(n_clusters=k,batch_size=1000,n_init=n_init, random_state=random_state)
+        labels = kmeans.fit_predict(data)
+        silhouette_scores.append(silhouette_score(data, labels))
+    # Find the optimal k within the narrowed range
+    optimal_k = narrow_k_range[np.argmax(silhouette_scores)]
+
+    print("Optimal k suggested by Silhouette Score:", optimal_k)
+
+    return optimal_k
+
+
+def find_representative_samples(data, labels, cluster_centers):
+    representative_samples = []
+    
+    for i, centroid in enumerate(cluster_centers):
+        cluster_points = data[labels == i]
+        distances = np.linalg.norm(cluster_points - centroid, axis=1)
+        representative_samples.append(np.where(labels == i)[0][np.argmin(distances)])
+    
+    return representative_samples
+
+
+def write_simpoints(simpoints_file,representative_samples,sorted_clusters):
+    with open(simpoints_file, 'w') as f:
+        for cluster in sorted_clusters:
+            f.write("{} {}\n".format(representative_samples[cluster], cluster))
+
+def write_weights(weight_file,labels,cluster_sizes,sorted_clusters):
+    total_samples = len(labels)
+    with open(weight_file, 'w') as f:
+        for cluster in sorted_clusters:
+            weight = cluster_sizes[cluster] / total_samples
+            f.write("{:.6f} {}\n".format(weight, cluster))
+
+def write_labels(label_file,labels, distances):
+    with open(label_file, 'w') as f:
+        for label, distance in zip(labels, distances):
+            f.write("{} {:.6f}\n".format(label, distance))
+
+def parse_globalcv(globalcv,threads):
+    if globalcv.endswith('.bb'):
+        with open(globalcv, "r") as file:
+            input_str=file.read()
+    elif globalcv.endswith('.bb.gz'):
+        # Open gzipped .bb.gz file
+        with gzip.open(globalcv, 'rt') as file:
+            input_str = file.read()
+    else:
+        raise ValueError("Unsupported file format. File must end with .bb or .bb.gz")
+    parser = FVParser(input_str)
+
+    num_points, num_dims = size_of_fv_file(parser)
+
+    print("Number of points: {}".format(num_points))
+    print("Number of dimensions: {}".format(num_dims))
+
+        # Reset the parser
+    parser.reset()
+    if int(threads)==1:   # single thread
+        result = Dataset1(num_points,num_dims)
+    load_fv_file(parser, result)
+    return result, num_points
+
+def dimension_reduce(origin,num_points,dimension):
+    print("Original shape: {}".format(origin.data.shape))
+    # Process each thread in parallel
+    n_jobs = -1  # Use all available cores
+    reduced_data_threads = Parallel(n_jobs=n_jobs)(delayed(process_thread)(origin[:,thread,:],dimension) for thread in range(origin.num_cols()))
+
+    return np.concatenate(reduced_data_threads, axis=1)
+
+def simpoint_in_one(globalcv,threads,simpoints_file,weights_file,label_file,dimension,max_k,n_init=5,random_state=42):
+    origin,num_points = parse_globalcv(globalcv,threads)   
+    #data = dimension_reduce(origin,num_points,int(dimension))
+    data = process_thread(origin.data,int(dimension))
+    print("after dimension reduce data shape:",data.shape)
+    # Find the best k
+    best_k = find_best_k(data,int(max_k),n_init,random_state=random_state)
+    # Perform k-means clustering with the best k
+    print("best_k is ",best_k)
+    kmeans = MiniBatchKMeans(n_clusters=best_k, n_init=n_init, random_state=random_state)
+    labels = kmeans.fit_predict(data)
+    # Find representative samples
+    representative_samples = find_representative_samples(data, labels, kmeans.cluster_centers_)
+
+    # Calculate cluster sizes
+    cluster_sizes = np.bincount(labels)
+
+    # Sort clusters based on their label (smallest to biggest)
+    sorted_clusters = sorted(range(best_k))
+
+    write_simpoints(simpoints_file,representative_samples,sorted_clusters)
+    write_weights(weights_file,labels,cluster_sizes,sorted_clusters)
+    # Calculate distances to cluster centers for all points
+    distances = np.linalg.norm(data - kmeans.cluster_centers_[labels], axis=1)
+    write_labels(label_file,labels, distances)
+    print("Files have been created:",simpoints_file,weights_file,label_file)
+
+globalcv=sys.argv[1]
+threads=sys.argv[2]
+simpoints_file=sys.argv[3]
+weights_file=sys.argv[4]
+label_file=sys.argv[5]
+dimension=sys.argv[6]
+max_k=sys.argv[7]
+simpoint_in_one(globalcv,threads,simpoints_file,weights_file,label_file,dimension,max_k,n_init=5,random_state=42)
+
+
+# /users/meditate/gem5/m5out/graph500_s_13_e_12/graph500_s_13_e_12_init/simpoint.bb.gz 1 a.simpoints a.weights a.labels 15 30
+# /users/meditate/matrix_bigball/looppoint/results/demo-matrix-1-test-passive-8-20240709141442/matrix.1_13205.Data/matrix.1_13205.global.bb 8 a.simpoints a.weights a.labels 100 20

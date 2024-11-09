@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+# dimension is single thread reduced d, default 15
+import numpy as np
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+from sklearn.cluster import MiniBatchKMeans
+from scipy.sparse import csr_matrix, vstack
+from joblib import Parallel, delayed
+from sklearn.decomposition import TruncatedSVD
+from kneed import KneeLocator
+from sklearn.neighbors import kneighbors_graph
+from sklearn.cluster import SpectralClustering
+from sklearn.preprocessing import StandardScaler
+from scipy.spatial.distance import euclidean
+import sys
+import gzip
+
+#import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
+
+from scipy.sparse.linalg import eigsh
+from scipy.sparse import csgraph
+from scipy.sparse.csgraph import connected_components
+from math import sqrt
+
+class Dataset:
+    def __init__(self, rows, cols, depth):
+        self.data = np.zeros((rows, cols, depth), dtype=np.float32)
+
+    def fill(self, value):
+        self.data.fill(value)
+
+    def num_rows(self):
+        return self.data.shape[0]
+
+    def num_cols(self):
+        return self.data.shape[1]
+
+    def num_depth(self):
+        return self.data.shape[2]
+
+    def __getitem__(self, index):
+        return self.data[index]
+
+    def __setitem__(self, index, value):
+        self.data[index] = value
+
+class FVParserToken:
+    def __init__(self, dimension, value):
+        self.dimension = dimension
+        self.value = value
+
+class FVParser:
+    def __init__(self, input_str):
+        self.original_input = input_str
+        self.reset()
+
+    def reset(self):
+        self.input_stream = self.original_input.splitlines()
+        self.line_number = 0
+
+    def next_line(self):
+        while self.input_stream:
+            buffer = self.input_stream.pop(0).strip()
+
+            if not buffer:
+                continue
+
+            if not buffer.startswith('T'):
+                continue
+
+            result = []
+            current_thread = []
+
+            for part in buffer.split():
+                if part.startswith(('T:', 'A:')):
+                    if current_thread:
+                        result.append(current_thread)
+                        current_thread = []
+                    continue
+
+                try:
+                    dimension, value = map(int, part.lstrip(':').split(':'))
+                    current_thread.append(FVParserToken(dimension, float(value)))
+                except ValueError:
+                    continue
+
+            if current_thread:
+                result.append(current_thread)
+
+            if result:
+                self.line_number += 1
+                return result
+
+        return None
+
+    def current_line_number(self):
+        return self.line_number
+
+
+def size_of_fv_file(parser):
+    num_points = 0
+    num_dims = 0
+
+    while True:
+        tokens = parser.next_line()
+        if tokens is None:
+            break
+        num_points += 1
+        for thread in tokens:
+            for token in thread:
+                num_dims = max(num_dims, token.dimension)
+    return num_points, num_dims
+
+def load_fv_file(parser, result):
+    result.fill(0.0)
+
+    row_weights = np.zeros(result.num_rows())
+
+
+    point = 0
+    while True:
+        current_vector = parser.next_line()
+        if current_vector is None:
+            break
+
+        sum_vector = sum(token.value for row in current_vector for token in row)
+
+        row_weights[point] = sum_vector
+
+        for i,row in enumerate(current_vector):
+            for token in row:
+                dim = token.dimension
+                val = token.value / sum_vector
+                result[point][i][dim-1] = val
+
+        point += 1
+
+# Function to process each thread
+def process_thread(thread_data,dimension):
+    # Apply TruncatedSVD to each thread
+    svd = TruncatedSVD(n_components=dimension)  # Adjust the number of components as needed
+    reduced_data = svd.fit_transform(thread_data)
+    return reduced_data
+
+
+def eigenDecomposition(A, max_k):
+    L = csgraph.laplacian(A, normed=True)
+
+    eigenvalues_o = eigsh(L, k=int(max_k), which='SM', return_eigenvectors=False, maxiter=10000)
+    eigenvalues = np.sort(eigenvalues_o)
+    if np.isclose(eigenvalues[0], 0, atol=1e-8):
+        eigenvalues[0] = 0
+
+    index_largest_gap = np.argmax(np.diff(eigenvalues))
+    nb_clusters = index_largest_gap + 1
+    return nb_clusters
+
+def mutual_knn_graph(X, n_neighbors):
+    knn_graph = kneighbors_graph(X, n_neighbors=n_neighbors, include_self=False)
+    # symmetrize the graph
+    knn_graph = 0.5 * (knn_graph + knn_graph.T)
+    knn_graph.data.fill(1)  # binary weights
+    return knn_graph
+
+def spectral_clustering_analysis(X, n_neighbors=20, max_k=20):
+    # Compute the affinity matrix using kNN
+    affinity_matrix = mutual_knn_graph(X, n_neighbors)
+    # Check if the graph is fully connected
+    n_components, labels = connected_components(affinity_matrix, directed=False, return_labels=True)
+    if n_components > 1:
+        print(f"Skipping n_neighbors={n_neighbors} because the graph is not fully connected. Number of components: {n_components}")
+        return None, None, None, n_components, None  # Skip spectral clustering
+
+    # Use eigengap heuristic to estimate the number of clusters
+    k = eigenDecomposition(affinity_matrix, max_k)
+
+    print(f"when neighbor is {n_neighbors} Estimated number of clusters: {k}")
+
+    # Perform Spectral Clustering
+    sc = SpectralClustering(n_clusters=k, affinity='precomputed', random_state=42)
+    cluster_labels = sc.fit_predict(affinity_matrix)
+
+    # Calculate centroids and weights
+    centroids = []
+    weights = []
+    centroid_indices = []
+    for i in range(k):
+        cluster_points = X[cluster_labels == i]
+        cluster_indices = np.where(cluster_labels == i)[0]
+        weight = len(cluster_points) / len(X)
+
+        # Calculate the mean of the cluster
+        cluster_mean = np.mean(cluster_points, axis=0)
+
+        # Find the point closest to the mean
+        distances = np.linalg.norm(cluster_points - cluster_mean, axis=1)
+        closest_point_index = np.argmin(distances)
+
+        # Get the global index of the centroid point
+        centroid_index = cluster_indices[closest_point_index]
+
+        centroids.append(X[centroid_index])
+        weights.append(weight)
+        centroid_indices.append(centroid_index)
+
+    return cluster_labels, centroids, weights, k, centroid_indices
+
+# Generate sample data
+# X, _ = make_blobs(n_samples=400, centers=6, cluster_std=0.60, random_state=0)
+# X = StandardScaler().fit_transform(X)
+
+def find_best_n_neighbors(data, n_neighbors_range):
+    results = Parallel(n_jobs=1)(delayed(process_n_neighbors)(n, data) for n in n_neighbors_range) #n_jobs=-1
+    best_n_neighbors, best_score = max(results, key=lambda x: x[1])
+    return best_n_neighbors, best_score
+
+def process_n_neighbors(n_neighbors, data):
+    cluster_labels, _, _, k, _ = spectral_clustering_analysis(data, n_neighbors=n_neighbors,max_k=max_k)
+    if cluster_labels is None:
+        return n_neighbors, 0  # Skip this n_neighbors value
+    if k==1:
+        return n_neighbors, 0
+
+    score = silhouette_score(data, cluster_labels)
+    return n_neighbors, score
+
+
+def parse_globalcv(globalcv,threads):
+    if globalcv.endswith('.bb'):
+        with open(globalcv, "r") as file:
+            input_str=file.read()
+    elif globalcv.endswith('.bb.gz'):
+        # Open gzipped .bb.gz file
+        with gzip.open(globalcv, 'rt') as file:
+            input_str = file.read()
+    else:
+        raise ValueError("Unsupported file format. File must end with .bb or .bb.gz")
+    parser = FVParser(input_str)
+
+    num_points, num_dims = size_of_fv_file(parser)
+
+    print("Number of points: {}".format(num_points))
+    print("Number of dimensions: {}".format(num_dims))
+
+        # Reset the parser
+    parser.reset()
+    result = Dataset(num_points, int(threads),num_dims)
+    load_fv_file(parser, result)
+    return result, num_points
+
+def dimension_reduce(origin,num_points,dimension):
+    print("Original shape: {}".format(origin.data.shape))
+    # Process each thread in parallel
+    n_jobs = -1  # Use all available cores
+    reduced_data_threads = Parallel(n_jobs=n_jobs)(delayed(process_thread)(origin[:,thread,:],dimension) for thread in range(origin.num_cols()))
+
+    return np.concatenate(reduced_data_threads, axis=1)
+
+def simpoint_in_one(globalcv,threads,simpoints_file,weights_file,label_file,dimension,max_k,random_state=42):
+    origin,num_points = parse_globalcv(globalcv,threads)       
+    data = dimension_reduce(origin,num_points,int(dimension))
+    print("after dimension reduce data shape:",data.shape)
+    X = StandardScaler().fit_transform(data)
+    # Perform Spectral Clustering analysis
+    # Define the range of n_neighbors to test
+    #n_neighbors_range = range(3, min(10*int(sqrt(len(X))),160,len(X)), 5)  # You can adjust this range as needed
+    n_neighbors_range = range(max(10,int(sqrt(len(X)))), min(10*int(sqrt(len(X))),160,len(X)), 5)
+    # Find the best n_neighbors
+    best_n_neighbors, best_score = find_best_n_neighbors(X, n_neighbors_range)
+    print("best_n_neighbors and best score:",best_n_neighbors,best_score)
+    cluster_labels, centroids, weights, best_k, centroid_indices = spectral_clustering_analysis(X,n_neighbors=best_n_neighbors, max_k=int(max_k))
+
+    # Sort clusters by size (smallest to largest)
+    cluster_sizes = [np.sum(cluster_labels == i) for i in range(best_k)]
+    sorted_clusters = sorted(range(best_k), key=lambda i: cluster_sizes[i])
+
+    # Create t.simpoints file
+    with open(simpoints_file, 'w') as f:
+        for i in sorted_clusters:
+            f.write(f"{centroid_indices[i]} {i}\n")
+
+    # Create t.weights file
+    with open(weights_file, 'w') as f:
+        for i in sorted_clusters:
+            f.write(f"{weights[i]:.6f} {i}\n")
+
+    # Create t.labels file
+    with open(label_file, 'w') as f:
+        for sample_idx, label in enumerate(cluster_labels):
+            centroid = centroids[label]
+            distance = euclidean(X[sample_idx], centroid)
+            f.write(f"{label} {distance:.6f}\n")
+    print("Files have been created:",simpoints_file,weights_file,label_file)
+
+globalcv=sys.argv[1]
+threads=sys.argv[2]
+simpoints_file=sys.argv[3]
+weights_file=sys.argv[4]
+label_file=sys.argv[5]
+dimension=sys.argv[6]
+max_k=sys.argv[7]
+simpoint_in_one(globalcv,threads,simpoints_file,weights_file,label_file,dimension,max_k,random_state=42)
+
+
+# /users/meditate/gem5/m5out/graph500_s_13_e_12/graph500_s_13_e_12_init/simpoint.bb.gz 1 a.simpoints a.weights a.labels 15 30
+# /users/meditate/matrix_bigball/looppoint/results/demo-matrix-1-test-passive-8-20240709141442/matrix.1_13205.Data/matrix.1_13205.global.bb 8 a.simpoints a.weights a.labels 100 20
+
+
+
+
